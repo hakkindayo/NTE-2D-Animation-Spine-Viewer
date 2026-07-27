@@ -1,33 +1,3 @@
-"""
-NTE Spine → PNG連番/動画 一括書き出しスクリプト(ブラウザ手動操作なし)
-
-1. UISpine フォルダ以下のFModel書き出しjsonから.skel/.atlasを復元し、
-   対応するpngテクスチャとあわせて NTE_2D フォルダ内のアセットごとのフォルダにまとめる。
-2. 各アセットの全アニメーションをヘッドレスChromium(spine-webgl)で1フレームずつ
-   決定論的にレンダリングしてPNG連番として書き出す。ffmpegがあれば
-   通常再生用の <アニメ名>.mp4(不透明・高画質)と、背景透過用の <アニメ名>_alpha.mov(PNGコーデック+アルファ)を
-   両方書き出す。mp4化に使った連番pngや抽出済み.skel/.atlas/テクスチャpngは変換後に削除する
-   (ffmpeg失敗時のみ連番pngをフォールバックとして残す)。
-   ブラウザは内部で自動操作するだけで、ユーザーが画面を開く必要はない。
-
-NTEはFModelの書き出し形式が鳴潮と異なり、SpineAtlasAssetとSpineSkeletonDataAssetが
-別々のjsonファイルに分かれている(例: SP_YLYYZ1.json + SP_YLYYZ1_Data.json)。
-また、atlasのプロパティ名も rawData ではなく RawData (先頭大文字)になっている。
-このスクリプトはその2ファイル構成に対応した抽出処理になっている。
-
-設定(読み込み元/保存先のパス)は、このスクリプトと同じフォルダに作られる
-nte_config.json に保存される。初回実行時に無ければ自動生成され、保存先フォルダも
-無ければ自動作成される。パスを変えたい場合はこのjsonを編集すればよい。
-
-事前準備 (初回のみ、コマンドプロンプトで実行):
-    pip install playwright numpy pillow
-    playwright install chromium
-    (mp4/movも欲しい場合。ほぼ必須) ffmpegをインストールしてPATHに通す
-    (背景透過movはffmpeg標準のPNGコーデックを使うので追加の対応は不要)
-
-使い方:
-    python NTE_2D.py
-"""
 import base64
 import http.server
 import io
@@ -43,8 +13,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from playwright.sync_api import sync_playwright
-
-# ---------- 0. 設定(json保存、フォルダ自動生成) ----------
 
 # ---------- 0. 設定(json保存、フォルダ自動生成) ----------
 
