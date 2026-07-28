@@ -1,4 +1,4 @@
-# NTE Spine Batch Exporter
+# NTE-2D-Animation-Spine-Viewer
 
 A Python script that automatically extracts, reconstructs, and batch-exports Spine animations (PNG sequences and videos) from FModel-exported JSON files, tailored for NTE assets.
 
