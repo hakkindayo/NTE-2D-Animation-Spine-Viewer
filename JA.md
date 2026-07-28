@@ -1,4 +1,4 @@
-# NTE Spine Batch Exporter
+# NTE-2D-Animation-Spine-Viewer
 
 FModelでエクスポートされたJSONファイルから、NTEのアセット向けにSpineアニメーション（PNG連番・動画）を自動で抽出し、復元・一括書き出しするPythonスクリプトです。
 
