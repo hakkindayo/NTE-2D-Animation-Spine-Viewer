@@ -82,6 +82,8 @@ CANVAS_DIM = 1200         # レンダリング解像度(正方形、px)
 MARGIN = 1.15             # skeleton boundsの余白倍率
 MAKE_VIDEO = True         # ffmpegがあればmp4/movも書き出す
 MAKE_ALPHA_MOV = True     # 背景透過版(*_alpha.mov, PNGコーデック)も書き出す
+SHOW_BROWSER_LOGS = False  # Trueにするとブラウザ側のconsole.log(スロット一覧など)も全部表示する。
+                            # Falseでも警告/エラーは常に表示される。デバッグ時だけTrueにするとよい。
 
 
 def get_free_port() -> int:
@@ -327,9 +329,15 @@ if (gl && typeof spine !== 'undefined') poll();
 // 静止画として書き出すと中身が空(白い板など)のまま目立って表示されてしまうことがある。
 // 名前にこれらのキーワードを含むスロットは、アニメーション適用のたびに強制的に非表示にする。
 const HIDE_SLOT_KEYWORDS = ['数字', '数据', 'shuju'];
+// 診断用: trueにすると、ブレンドモードがScreen(=3)の全スロットを非表示にする。
+// キーワード指定では消えない「白い板」の原因がScreen合成全般にあるのかどうかを
+// 切り分けるためのフラグ。原因が特定できたら本来は個別のスロット名指定に戻す。
+const DEBUG_HIDE_ALL_SCREEN_BLEND = true;
 function hideDebugSlots() {
   skeleton.slots.forEach(s => {
-    if (HIDE_SLOT_KEYWORDS.some(kw => s.data.name.includes(kw))) {
+    const nameHit = HIDE_SLOT_KEYWORDS.some(kw => s.data.name.includes(kw));
+    const screenHit = DEBUG_HIDE_ALL_SCREEN_BLEND && s.data.blendMode === 3;
+    if (nameHit || screenHit) {
       s.setAttachment(null);
     }
   });
@@ -353,6 +361,44 @@ window.renderFrame = function(animName, time, bgR, bgG, bgB) {
   return canvas.toDataURL("image/png");
 };
 
+// 高速化用: フレーム範囲をまとめて1回のブラウザ呼び出しで処理する。
+// フレームごとにPython<->ブラウザを往復すると、その通信オーバーヘッドが
+// フレーム数×2(黒背景・白背景)だけ積み重なって支配的なボトルネックになるため、
+// 指定範囲のフレームをまとめて描画し、配列でまとめて返す。
+// 中間キャプチャはPNG(可逆)にしている(JPEGだと圧縮ノイズでフレームごとに
+// 低アルファ判定がちらつき、透過動画が点滅する不具合があったため)。
+// needAlphaがfalseの場合は白背景の描画を丸ごとスキップする(透過movが不要な時の高速化。
+// この場合は黒背景の描画結果をそのまま不透明として使う)。
+window.renderFrameBatch = function(animName, startFrame, count, fps, needAlpha) {
+  const anim = animations[animName];
+  const blackUrls = [];
+  const whiteUrls = [];
+  for (let k = 0; k < count; k++) {
+    const t = (startFrame + k) / fps;
+    skeleton.setToSetupPose();
+    anim.apply(skeleton, 0, t, false, null, 1, spine.MixBlend.setup, spine.MixDirection.mixIn);
+    hideDebugSlots();
+    skeleton.updateWorldTransform(spine.Physics.update);
+
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    renderer.begin();
+    renderer.drawSkeleton(skeleton, false);
+    renderer.end();
+    blackUrls.push(canvas.toDataURL("image/png"));
+
+    if (needAlpha) {
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      renderer.begin();
+      renderer.drawSkeleton(skeleton, false);
+      renderer.end();
+      whiteUrls.push(canvas.toDataURL("image/png"));
+    }
+  }
+  return { black: blackUrls, white: whiteUrls };
+};
+
 window.getAnimDuration = function(animName) {
   return animations[animName].duration;
 };
@@ -362,7 +408,7 @@ window.getAnimDuration = function(animName) {
 // カメラを固定すると、動きの大きいVFXなどでは実際の描画位置とズレてしまうため。
 window.fitCameraToAnim = function(animName, samples) {
   const anim = animations[animName];
-  const n = Math.max(1, samples || 40);
+  const n = Math.max(1, samples || 20);
   const offset = new spine.Vector2(), size = new spine.Vector2();
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i <= n; i++) {
@@ -435,6 +481,14 @@ def compose_alpha_from_black_white(black_arr: np.ndarray, white_arr: np.ndarray)
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def opaque_rgba_from_black(black_arr: np.ndarray) -> Image.Image:
+    """透過が不要な場合(MAKE_ALPHA_MOV=False)用: 白背景描画を省略し、
+    黒背景の描画結果をそのままアルファ255の不透明画像として使う。"""
+    alpha = np.full(black_arr.shape[:2], 255.0, dtype=np.float32)
+    rgba = np.dstack([black_arr, alpha]).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
 def cleanup_keep_only_deliverables(out_dir: Path):
     """out_dir配下から *.mp4 / *_alpha.mov 以外を全部削除する
     (frames連番png、抽出した.skel/.atlas/テクスチャpngなど)。"""
@@ -445,28 +499,34 @@ def cleanup_keep_only_deliverables(out_dir: Path):
             item.unlink(missing_ok=True)
 
 
-def encode_outputs(flat_pattern: str, rgba_pattern: str, out_dir: Path, name: str):
-    """flat_pattern(黒背景に正しく合成済みのRGB連番png)から通常再生用の<name>.mp4を、
-    rgba_pattern(差分マットで復元したRGBA連番png)から背景透過用の<name>_alpha.mov
-    (PNGコーデック+アルファ, MAKE_ALPHA_MOV有効時のみ)を書き出す。
+def encode_outputs(rgba_pattern: str, out_dir: Path, name: str, canvas_dim: int):
+    """rgba_pattern(差分マットで復元したRGBA連番png)1種類だけから、
+    通常再生用の<name>.mp4(黒背景に合成、不透明)と、背景透過用の<name>_alpha.mov
+    (PNGコーデック+アルファ, MAKE_ALPHA_MOV有効時のみ)の両方を書き出す。
+
+    以前はmp4用に黒背景直描画の別連番(flat_)を保存していたが、
+    「RGBAを黒背景の上にoverlayフィルタで合成してからyuv420pにする」のと
+    数値的に完全に同じ結果になることを確認できたため、frame_(RGBA)1種類だけで
+    両方を賄うようにした(保存するファイルが減り、シンプルになる)。
 
     透過は当初VP9(webm)で試したが、VLC/Discord/YMM4など多くのプレイヤーで
     アルファチャンネルが正しくデコードされないことが確認されたため、より確実な
-    PNGコーデック入りの.mov(可逆・透過対応)に変更した。ファイルサイズは大きくなるが
-    再生側の対応状況に左右されにくい。
-    mp4側は4:2:0のクロマ間引きで細かい反射・ハイライトの色がぼやけるのを避けるため
-    yuv444p(色情報を間引かない)+高めの画質設定(CRF低め)にしてある。
+    PNGコーデック入りの.movに変更したが、PNGは1フレームごとに丸ごと展開が必要で
+    再生ソフト側の負荷が高く、コマ落ち/ちらつきの原因になることが分かったため、
+    ちゃんとした動画圧縮でアルファにも対応する ProRes 4444 に変更した。
+    mp4側は色ズレを避けるため、素直な yuv420p + シンプルな設定にしてある
+    (yuv444p+フルレンジ指定を試したが、逆に一部の再生環境で色が変わってしまったため元に戻した)。
 
     戻り値: (mp4_ok, mov_ok)。ファイルサイズとffmpegの終了コードで成功を判定する
     (単に存在するかだけだと、壊れた/再生できないファイルを成功扱いしてしまうため)。
     """
     mp4_path = out_dir / f"{name}.mp4"
     r1 = subprocess.run([
-        "ffmpeg", "-y", "-framerate", str(FPS),
-        "-i", flat_pattern,
-        "-pix_fmt", "yuv444p", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-crf", "16", "-preset", "slow",
-        "-color_range", "pc", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=black:s={canvas_dim}x{canvas_dim}:r={FPS}",
+        "-framerate", str(FPS), "-i", rgba_pattern,
+        "-filter_complex", "[0:v][1:v]overlay=shortest=1:format=auto,format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-crf", "18", "-preset", "medium",
         "-movflags", "+faststart",
         str(mp4_path)
     ], check=False, capture_output=True)
@@ -481,7 +541,7 @@ def encode_outputs(flat_pattern: str, rgba_pattern: str, out_dir: Path, name: st
         r2 = subprocess.run([
             "ffmpeg", "-y", "-framerate", str(FPS),
             "-i", rgba_pattern,
-            "-c:v", "png",
+            "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
             str(mov_path)
         ], check=False, capture_output=True)
         mov_ok = mov_path.exists() and mov_path.stat().st_size > 1024 and r2.returncode == 0
@@ -508,11 +568,11 @@ def render_character(page, char_dir_name, skel_name, atlas_name):
     try:
         page.wait_for_function(
             "() => window.ready === true || window.loadError !== null",
-            timeout=30000,
+            timeout=600000,
         )
     except Exception:
         load_error = page.evaluate("window.loadError")
-        raise RuntimeError(f"読み込みタイムアウト(30秒)。window.loadError={load_error!r}")
+        raise RuntimeError(f"読み込みタイムアウト(10分)。window.loadError={load_error!r}")
 
     load_error = page.evaluate("window.loadError")
     if load_error:
@@ -526,26 +586,41 @@ def render_character(page, char_dir_name, skel_name, atlas_name):
         if not duration or duration <= 0:
             continue
         # このアニメーション全体の動きに合わせてカメラを合わせ直す(位置ズレ対策)
-        page.evaluate("([a, s]) => window.fitCameraToAnim(a, s)", [anim, 40])
+        page.evaluate("([a, s]) => window.fitCameraToAnim(a, s)", [anim, 20])
         n_frames = max(1, int(duration * FPS))
         frame_dir = out_dir / "frames" / anim
         frame_dir.mkdir(parents=True, exist_ok=True)
 
-        for i in range(n_frames):
-            t = i / FPS
-            black_url = page.evaluate("([a, t]) => window.renderFrame(a, t, 0, 0, 0)", [anim, t])
-            white_url = page.evaluate("([a, t]) => window.renderFrame(a, t, 1, 1, 1)", [anim, t])
-            black_arr = decode_frame_rgb(black_url)
-            white_arr = decode_frame_rgb(white_url)
-            rgba_img = compose_alpha_from_black_white(black_arr, white_arr)
-            rgba_img.save(frame_dir / f"frame_{i:04d}.png")
-            Image.fromarray(black_arr.astype(np.uint8), mode="RGB").save(frame_dir / f"flat_{i:04d}.png")
+        BATCH_SIZE = 20  # フレームをまとめてブラウザに送る単位(往復回数を減らして高速化)
+        idx = 0
+        t_start = time.time()
+        for start in range(0, n_frames, BATCH_SIZE):
+            count = min(BATCH_SIZE, n_frames - start)
+            result = page.evaluate(
+                "([a, s, c, fps, na]) => window.renderFrameBatch(a, s, c, fps, na)",
+                [anim, start, count, FPS, MAKE_ALPHA_MOV]
+            )
+            for k in range(count):
+                black_arr = decode_frame_rgb(result["black"][k])
+                if MAKE_ALPHA_MOV:
+                    white_arr = decode_frame_rgb(result["white"][k])
+                    rgba_img = compose_alpha_from_black_white(black_arr, white_arr)
+                else:
+                    rgba_img = opaque_rgba_from_black(black_arr)
+                rgba_img.save(frame_dir / f"frame_{idx:04d}.png")
+                idx += 1
+
+            elapsed = time.time() - t_start
+            pct = idx / n_frames * 100
+            eta = (elapsed / idx) * (n_frames - idx) if idx > 0 else 0
+            print(f"    [進捗] {char_dir_name} / {anim} : {idx}/{n_frames}フレーム "
+                  f"({pct:.0f}%) 経過{elapsed:.0f}秒 残り約{eta:.0f}秒", flush=True)
 
         print(f"[書き出しOK] {char_dir_name} / {anim} : {n_frames}フレーム -> {frame_dir}")
 
         if MAKE_VIDEO and shutil.which("ffmpeg"):
             mp4_ok, mov_ok = encode_outputs(
-                str(frame_dir / "flat_%04d.png"), str(frame_dir / "frame_%04d.png"), out_dir, anim
+                str(frame_dir / "frame_%04d.png"), out_dir, anim, CANVAS_DIM
             )
             if mp4_ok:
                 print(f"    動画も書き出し: {out_dir / (anim + '.mp4')}"
@@ -584,7 +659,11 @@ def main():
         with sync_playwright() as p:
             browser = p.chromium.launch()
             page = browser.new_page(viewport={"width": CANVAS_DIM, "height": CANVAS_DIM})
-            page.on("console", lambda msg: print(f"    [ブラウザconsole] {msg.type}: {msg.text}"))
+            page.on("console", lambda msg: (
+                print(f"    [ブラウザconsole] {msg.type}: {msg.text}")
+                if SHOW_BROWSER_LOGS or msg.type in ("warning", "error")
+                else None
+            ))
             page.on("pageerror", lambda exc: print(f"    [ブラウザpageerror] {exc}"))
             for char_dir_name, skel_name, atlas_name, manifest_key in entries:
                 try:
